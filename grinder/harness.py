@@ -17,6 +17,8 @@ import uuid
 import pytest
 from uuid import uuid4
 import random
+from fcntl import flock, LOCK_EX, LOCK_UN
+from contextlib import contextmanager
 
 from . logger import log
 from . config import default_config
@@ -26,10 +28,30 @@ from . client import create_client
 from . instance import InstanceFactory
 from . instance import wait_while_status
 from . host import Host
+from . requirements import INSTALL_POLICY
 
 # This is set by pytest_runtest_setup in conftest.py.
 # This is done prior to each test.
 test_name = ''
+GRINDER_LOCKFILE = "/tmp/grinder.lock"
+
+def make_policy_locker():
+    fp = open(GRINDER_LOCKFILE, 'r+')
+    def lock():
+        flock(fp, LOCK_EX)
+    def unlock():
+        flock(fp, LOCK_UN)
+    return lock, unlock
+
+policy_lock, policy_unlock = make_policy_locker()
+
+@contextmanager
+def locked_policy():
+    policy_lock()
+    try:
+        yield
+    finally:
+        policy_unlock()
 
 def boot(client, config, image_config=None, flavor=None):
     name = '%s-%s' % (config.run_name, test_name)
@@ -235,6 +257,11 @@ class TestHarness(Notifier):
         Notifier.__init__(self)
         self.config = config
         self.test_name = test_name
+        self.policy = \
+"""
+[*]
+managed = false
+"""
         (self.client, self.gcapi) = create_client(self.config)
 
     @Notifier.notify
@@ -273,10 +300,23 @@ class TestHarness(Notifier):
         if self.config.os_auth_url == None:
             log.error('os_auth_url must be defined')
             assert False
+        # Install the default policy to ignore all VMs on the test machine.
+        self.install_policy()
 
     @Notifier.notify
     def teardown(self):
         pass
+
+    def install_policy(self):
+        if INSTALL_POLICY.check(self.client):
+            # Since we always flock on the same file pointer within a single
+            # grinder process, recursive calls to flock will not block. This
+            # allows any callers of install_policy to grab the lock around the
+            # install_policy() call if they want a large critical section around
+            # the policy being installed, without having to worry about
+            # deadlocks.
+            with locked_policy():
+                self.gcapi.install_policy(self.policy, wait=True)
 
     @Notifier.notify
     def boot(self, image_finder, agent=True, flavor=None):
